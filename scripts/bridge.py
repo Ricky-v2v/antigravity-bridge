@@ -52,7 +52,18 @@ class Bridge:
     # ─── Persistent connection ───
     async def _conn(s):
         """Ensure WebSocket is connected; reuse existing or create new."""
-        if s._ws and s._ws.open:return
+        if s._ws:
+            try:
+                st=getattr(s._ws,'state',None)
+                if st is not None:
+                    try:
+                        from websockets.protocol import State
+                        if st==State.OPEN:return
+                    except Exception:
+                        if int(st)==1:return
+                if getattr(s._ws,'open',False):return
+            except Exception:
+                pass
         url=await asyncio.get_event_loop().run_in_executor(None,s._find_ws)
         s._ws=await websockets.connect(url,max_size=10*1024*1024,open_timeout=10)
         s._pending={};s._obs_ok=False
@@ -124,28 +135,35 @@ class Bridge:
         """Inject or reset MutationObserver for O(1) completion detection.
         
         Instead of polling document.body.innerText (O(page_size)) every 2s,
-        we inject a MutationObserver that watches for new Good/Bad buttons.
+        we inject a MutationObserver that watches for new response controls.
         The observer sets window.__ag.done=true when a NEW response completes.
         Our polling loop just checks this boolean — near-zero overhead.
         """
         if s._obs_ok:
             r = await s._ev("""(()=>{
                 if(!window.__ag) return 'MISS';
-                const btns=[...document.querySelectorAll('button')];
                 window.__ag.done=false;
-                window.__ag.base=btns.filter(b=>b.textContent.trim()==='Good').length;
+                const btns=[...document.querySelectorAll('button')];
+                window.__ag.good=btns.filter(b=>b.textContent.trim()==='Good').length;
+                window.__ag.copy=btns.filter(b=>b.textContent.trim()==='Copy').length;
                 return 'OK';
             })()""")
             if str(r) == 'OK': return
             s._obs_ok = False # 如果丢失了，继续往下重新注入
         await s._ev("""(()=>{
             const btns=[...document.querySelectorAll('button')];
-            window.__ag={done:false,base:btns.filter(b=>b.textContent.trim()==='Good').length};
+            window.__ag={
+                done:false,
+                good:btns.filter(b=>b.textContent.trim()==='Good').length,
+                copy:btns.filter(b=>b.textContent.trim()==='Copy').length
+            };
             let tm=null;
             const ck=()=>{
                 if(window.__ag.done)return;
-                const cur=[...document.querySelectorAll('button')].filter(b=>b.textContent.trim()==='Good').length;
-                if(cur>window.__ag.base)window.__ag.done=true;
+                const curBtns=[...document.querySelectorAll('button')];
+                const curGood=curBtns.filter(b=>b.textContent.trim()==='Good').length;
+                const curCopy=curBtns.filter(b=>b.textContent.trim()==='Copy').length;
+                if(curGood>window.__ag.good || curCopy>window.__ag.copy)window.__ag.done=true;
             };
             if(window.__agObs)window.__agObs.disconnect();
             window.__agObs=new MutationObserver(()=>{
@@ -230,7 +248,7 @@ class Bridge:
                     parts=body.split(marker)
                     if len(parts)>=2:
                         after=parts[-1]
-                        has_done='Good\nBad' in after
+                        has_done=('Good\nBad' in after) or ('\nCopy' in after) or (after.strip().endswith('Copy'))
                         has_gen='Generating' in after
                         if has_done and not has_gen:
                             return{'response':s._clean(after,prompt),'elapsed':round(time.time()-t0,1),'model':s.model,'status':'ok'}
@@ -265,7 +283,7 @@ class Bridge:
         for att in range(3):
             try:
                 r=await s._do_chat(prompt,timeout,model)
-                if r.get('status') in('ok','high_traffic'):return r
+                if r.get('status') in('ok','high_traffic','timeout','agent_error'):return r
                 if att<2:
                     try:await s._reload_page()
                     except:pass
@@ -371,23 +389,56 @@ class Bridge:
 # ─── HTTP Server ───
 b=None
 class H(BaseHTTPRequestHandler):
+    def _read_json(s,allow_empty=False):
+        try:ln=int(s.headers.get('Content-Length') or 0)
+        except:ln=0
+        if ln<=0:
+            if allow_empty:return {}
+            raise ValueError('empty')
+        raw=s.rfile.read(ln)
+        try:d=json.loads(raw)
+        except Exception as e:raise ValueError('invalid_json') from e
+        if not isinstance(d,dict):raise ValueError('invalid_json')
+        return d
+    def _int(s,v,default):
+        if v is None:return default
+        if isinstance(v,bool):raise ValueError('invalid_int')
+        try:return int(v)
+        except Exception as e:raise ValueError('invalid_int') from e
     def do_POST(s):
-        d=json.loads(s.rfile.read(int(s.headers.get('Content-Length',0))))
+        try:
+            d=s._read_json(allow_empty=(s.path=='/new'))
+        except ValueError as e:
+            s._j(400,{'error':str(e),'status':'error'})
+            return
         if s.path=='/chat':
-            p=d.get('prompt','');m=d.get('model');to=d.get('timeout',180)
+            p=str(d.get('prompt',''))
+            m=d.get('model')
+            try:to=s._int(d.get('timeout',180),180)
+            except ValueError:
+                s._j(400,{'error':'invalid_timeout','status':'error'})
+                return
             ts=time.strftime('%H:%M:%S');print(f'[{ts}] >> {p[:80]}',flush=True)
             try:
                 r=b.chat(p,to,m);s._j(200,r)
                 print(f'[{ts}] << [{r.get("status")}] {r.get("response",r.get("error",""))[:80]} ({r.get("elapsed",0)}s)',flush=True)
-            except Exception as e:s._j(500,{'error':str(e),'status':'error'});print(f'[{ts}] !! {e}',flush=True)
+            except Exception as e:
+                msg=str(e) or type(e).__name__
+                s._j(500,{'error':msg,'status':'error'})
+                print(f'[{ts}] !! {msg}',flush=True)
         elif s.path=='/model':
-            mn=d.get('model','')
+            mn=str(d.get('model',''))
             if mn not in MODELS:s._j(400,{'error':'Unknown','status':'error'})
             else:
                 try:s._j(200,b.switch(mn))
                 except Exception as e:s._j(500,{'error':str(e),'status':'error'})
         elif s.path=='/async':
-            p=d.get('prompt','');m=d.get('model');to=d.get('timeout',600)
+            p=str(d.get('prompt',''))
+            m=d.get('model')
+            try:to=s._int(d.get('timeout',600),600)
+            except ValueError:
+                s._j(400,{'error':'invalid_timeout','status':'error'})
+                return
             tid=uuid.uuid4().hex[:12];_tadd(tid,'chat')
             ts=time.strftime('%H:%M:%S');print(f'[{ts}] >> [async:{tid}] {p[:80]}',flush=True)
             def _run():
