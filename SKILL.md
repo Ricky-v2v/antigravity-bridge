@@ -40,10 +40,23 @@ ag "Write a bash script" opus
 bash scripts/agy_invoke.sh "Fix bug in common.sh" --model sonnet
 ```
 
+## Additional Endpoints
+```bash
+# Async chat (non-blocking, poll result later)
+curl -s -X POST http://localhost:19999/async \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Your question","model":"Claude Opus 4.6 (Thinking)"}'
+# Returns: {"status":"accepted","task_id":"abc123"}
+# Poll:    curl -s http://localhost:19999/task/abc123
+
+# New chat (reload page, clear context)
+curl -s -X POST http://localhost:19999/new -d '{}'
+```
+
 ## Requirements
 - Mac with Antigravity installed and running
 - Antigravity started with `--remote-debugging-port=9229`
-- Bridge mode: run `bridge.py`
+- Bridge mode: run `bridge.py` (v17-fast, persistent WS + MutationObserver)
 - IDE mode: Node.js with `ws` package
 
 ## Configuration
